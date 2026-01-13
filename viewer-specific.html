@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PDF Page Viewer (IndexedDB Cached)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <style>
+    :root{
+      --bg:#0b0c10; --fg:#cfd8dc; --muted:#90a4ae; --accent:#7cb342;
+      --btn:#263238; --btn-hover:#37474f; --btn-active:#455a64; --danger:#e53935;
+      --border:#1b2328;
+    }
+    html, body {
+      margin:0; padding:0; background:var(--bg); color:var(--fg);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      min-height:100svh;
+    }
+    .hidden{display:none!important;}
+    .small{color:var(--muted); font-size:.9rem;}
+    main { margin: 2rem auto; width:min(100%, 980px); }
+
+    .paper{
+      background:#11161a;
+      border-radius: 18px;
+      box-shadow:0 20px 60px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.05) inset;
+      padding: 1.5rem;
+    }
+
+    .toolbar{display:flex; gap:.5rem; align-items:center; justify-content:flex-end;}
+    .btn{
+      border:1px solid #111; background:var(--btn); color:var(--fg);
+      padding:.6rem 1rem; border-radius:.5rem; cursor:pointer;
+    }
+    .btn:hover{background:var(--btn-hover);}
+    .btn-accent{background:var(--accent); color:#0b0c10;}
+    .btn-outline{background:transparent; border-color:var(--border);}
+    .btn-small{padding:.45rem .7rem; font-size:.95rem;}
+
+    h1{ margin:.25rem 0 .35rem 0; font-weight:750; font-size:1.35rem; }
+
+    .pill{
+      font-size:.85rem; padding:.2rem .5rem; border-radius:.9rem;
+      background:#1c313a; color:#b2dfdb;
+    }
+
+    .info{
+      display:flex; gap:.75rem; flex-wrap:wrap; align-items:center;
+      border-top:1px dashed rgba(255,255,255,.08);
+      border-bottom:1px dashed rgba(255,255,255,.08);
+      padding:.6rem 0; margin:.5rem 0 1rem 0;
+    }
+
+    .actions{ display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:1rem; }
+    .actions .spacer{ flex:1; }
+
+    .canvas-wrap{
+      background:#0c1114; border:1px solid var(--border);
+      border-radius:10px; padding:.75rem;
+    }
+    #pdfCanvas{
+      width:100%; background:white; border-radius:6px;
+    }
+  </style>
+</head>
+
+<body>
+<main>
+<section class="paper">
+  <header style="display:flex; justify-content:space-between;">
+    <div>
+      <h1>PDF Page Viewer</h1>
+      <p class="small">
+        Use <code>?fileName=1.pdf&page=12</code>
+      </p>
+    </div>
+    <div class="toolbar">
+      <a href="./" class="btn btn-small">↻ Reload</a>
+    </div>
+  </header>
+
+  <div class="small">
+    <span id="status" class="pill">Loading…</span>
+  </div>
+
+  <div class="info">
+    <div><b>File:</b> <span id="file">—</span></div>
+    <div><b>Pages:</b> <span id="count">—</span></div>
+    <div><b>Current page:</b> <span id="currentPage">—</span></div>
+  </div>
+
+  <div class="actions">
+    <button id="reroll" class="btn btn-small">🎲 Random page</button>
+    <button id="copyTextBtn" class="btn btn-accent btn-small">📋 Copy page text + ChatGPT</button>
+    <button id="copyAmp2Btn" class="btn btn-accent btn-small">📋 Copy page text (Amp2)</button>
+    <div class="spacer"></div>
+    <button id="clearCache" class="btn btn-outline btn-small">🗑️ Clear cache</button>
+  </div>
+
+  <div class="canvas-wrap">
+    <canvas id="pdfCanvas"></canvas>
+  </div>
+</section>
+</main>
+
+<script type="module">
+import { getDocument, GlobalWorkerOptions } from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.mjs";
+GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.mjs";
+
+const $ = s => document.querySelector(s);
+const statusEl = $("#status");
+const fileEl = $("#file");
+const countEl = $("#count");
+const currentEl = $("#currentPage");
+const canvas = $("#pdfCanvas");
+const ctx = canvas.getContext("2d");
+
+const params = new URLSearchParams(location.search);
+const rawFile = params.get("fileName");
+const rawPage = parseInt(params.get("page"), 10);
+
+function sanitizePdfName(name){
+  if(!name) return null;
+  const s = decodeURIComponent(name).trim();
+  return /^[A-Za-z0-9._-]+\.pdf$/i.test(s) ? s : null;
+}
+
+function clamp(n, min, max){
+  return Math.max(min, Math.min(max, n));
+}
+
+/* ===== IndexedDB cache ===== */
+const DB_NAME = "pdfCacheDB_v2";
+const STORE_NAME = "pdfs";
+const CHUNK_SIZE = 1024 * 1024;
+let dbPromise;
+
+function openDB(){
+  if(dbPromise) return dbPromise;
+  dbPromise = new Promise((res, rej)=>{
+    const r = indexedDB.open(DB_NAME, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(STORE_NAME);
+    r.onerror = () => rej(r.error);
+    r.onsuccess = () => res(r.result);
+  });
+  return dbPromise;
+}
+
+async function clearAllCache(){
+  const db = await openDB();
+  return new Promise(res=>{
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).clear();
+    tx.oncomplete = res;
+  });
+}
+
+async function getCachedChunks(name){
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, "readonly");
+  const store = tx.objectStore(STORE_NAME);
+  const keys = await store.getAllKeys();
+  const parts = keys.filter(k=>k.startsWith(`${name}-chunk-`))
+                    .sort((a,b)=>+a.split("-").pop() - +b.split("-").pop());
+  if(!parts.length) return null;
+
+  const blobs = await Promise.all(parts.map(k=>store.get(k)));
+  return new Blob(blobs);
+}
+
+async function loadAndCachePdfChunks(name, url){
+  const head = await fetch(url, {method:"HEAD"});
+  const size = +head.headers.get("content-length");
+  const chunks = [];
+  for(let start=0; start<size; start+=CHUNK_SIZE){
+    const end = Math.min(start+CHUNK_SIZE, size);
+    const r = await fetch(url,{headers:{Range:`bytes=${start}-${end-1}`}});
+    const buf = await r.arrayBuffer();
+    const db = await openDB();
+    const tx = db.transaction(STORE_NAME,"readwrite");
+    tx.objectStore(STORE_NAME).put(buf,`${name}-chunk-${start}`);
+    chunks.push(buf);
+  }
+  return new Blob(chunks).arrayBuffer();
+}
+
+/* ===== PDF ===== */
+let pdf, total, current;
+
+async function renderPage(n){
+  const page = await pdf.getPage(n);
+  const vp = page.getViewport({scale:1.5});
+  canvas.width = vp.width;
+  canvas.height = vp.height;
+  await page.render({canvasContext:ctx, viewport:vp}).promise;
+  current = n;
+  currentEl.textContent = n;
+}
+
+async function loadPdf(name){
+  const safe = sanitizePdfName(name);
+  if(!safe) throw new Error("Invalid fileName");
+
+  const url = new URL("./"+safe, location.href);
+  const cached = await getCachedChunks(safe);
+  const data = cached ? await cached.arrayBuffer()
+                      : await loadAndCachePdfChunks(safe, url.href);
+
+  pdf = await getDocument({data}).promise;
+  total = pdf.numPages;
+
+  fileEl.textContent = safe;
+  countEl.textContent = total;
+
+  const initialPage = Number.isInteger(rawPage)
+    ? clamp(rawPage, 1, total)
+    : 1;
+
+  await renderPage(initialPage);
+  statusEl.textContent = "Loaded";
+}
+
+/* ===== Controls ===== */
+$("#reroll").onclick = () => {
+  if(total) renderPage(1 + Math.floor(Math.random()*total));
+};
+
+$("#clearCache").onclick = async ()=>{
+  if(confirm("Clear cached PDF chunks?")){
+    await clearAllCache();
+    statusEl.textContent = "Cache cleared";
+  }
+};
+
+/* ===== Boot ===== */
+(async()=>{
+  try{
+    if(!rawFile) throw new Error("Missing ?fileName");
+    await loadPdf(rawFile);
+  }catch(e){
+    statusEl.textContent = e.message;
+  }
+})();
+</script>
+</body>
+</html>
