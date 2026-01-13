@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PDF Random Page Viewer (Chunked IndexedDB Caching)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <style>
+    :root{
+      --bg:#0b0c10; --fg:#cfd8dc; --muted:#90a4ae; --accent:#7cb342;
+      --btn:#263238; --btn-hover:#37474f; --btn-active:#455a64; --danger:#e53935;
+      --border:#1b2328;
+    }
+    html, body {
+      margin:0; padding:0; background:var(--bg); color:var(--fg);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      min-height:100svh;
+    }
+    .small{color:var(--muted); font-size:.9rem;}
+    main { margin: 2rem auto; width:min(100%, 980px); }
+    .paper{
+      background:#11161a;
+      border-radius: 18px;
+      box-shadow:0 20px 60px rgba(0,0,0,.5);
+      padding: 1.5rem;
+    }
+    .btn{
+      background:#263238; color:#cfd8dc;
+      padding:.6rem 1rem; border-radius:.5rem;
+      border:1px solid #111; cursor:pointer;
+    }
+    .btn-accent{background:#7cb342;color:#0b0c10;}
+    .btn-outline{background:transparent;border-color:#1b2328;}
+    .btn-small{padding:.45rem .7rem;font-size:.95rem;}
+    .info{display:flex;gap:.75rem;margin:1rem 0;}
+    .canvas-wrap{
+      background:#0c1114;border:1px solid #1b2328;
+      border-radius:10px;padding:.75rem;
+    }
+    #pdfCanvas{width:100%;background:white;border-radius:6px;}
+  </style>
+</head>
+
+<body>
+<main>
+<section class="paper">
+  <h1>PDF Random Page Viewer</h1>
+
+  <div class="small">
+    <span id="status">Loading…</span>
+  </div>
+
+  <div class="info">
+    <div><b>File:</b> <span id="file">—</span></div>
+    <div><b>Pages:</b> <span id="count">—</span></div>
+    <div><b>Current:</b> <span id="currentPage">—</span></div>
+  </div>
+
+  <div style="margin-bottom:1rem;">
+    <button id="reroll" class="btn btn-small">🎲 Random page</button>
+    <button id="copyTextBtn" class="btn btn-accent btn-small">📋 Copy + ChatGPT</button>
+    <button id="copyAmp2Btn" class="btn btn-accent btn-small">📋 Copy (Amp2)</button>
+    <button id="clearCache" class="btn btn-outline btn-small">🗑️ Clear cache</button>
+  </div>
+
+  <div class="canvas-wrap">
+    <canvas id="pdfCanvas"></canvas>
+  </div>
+</section>
+</main>
+
+<script type="module">
+import { getDocument, GlobalWorkerOptions } from
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.mjs";
+GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.mjs";
+
+const $ = s => document.querySelector(s);
+const statusEl=$("#status"), fileEl=$("#file"),
+      countEl=$("#count"), currentEl=$("#currentPage");
+const canvas=$("#pdfCanvas"), ctx=canvas.getContext("2d");
+
+const params=new URLSearchParams(location.search);
+const rawFile=params.get("fileName");
+
+function randomInt(min,max){
+  return min + Math.floor(Math.random()*(max-min+1));
+}
+
+/* ===== IndexedDB ===== */
+const DB_NAME="pdfCacheDB_v2";
+const STORE_NAME="pdfs";
+const CHUNK_SIZE=1024*1024;
+let dbPromise;
+
+function openDB(){
+  if(dbPromise) return dbPromise;
+  dbPromise=new Promise((res,rej)=>{
+    const r=indexedDB.open(DB_NAME,1);
+    r.onupgradeneeded=()=>r.result.createObjectStore(STORE_NAME);
+    r.onsuccess=()=>res(r.result);
+    r.onerror=()=>rej(r.error);
+  });
+  return dbPromise;
+}
+
+async function getCachedChunks(name){
+  const db=await openDB();
+  const tx=db.transaction(STORE_NAME,"readonly");
+  const store=tx.objectStore(STORE_NAME);
+  const req=store.getAllKeys();
+
+  return new Promise((resolve,reject)=>{
+    req.onsuccess=async()=>{
+      /* ✅ FIX: force real array */
+      const keys=Array.from(req.result||[])
+        .filter(k=>k.startsWith(`${name}-chunk-`));
+
+      if(!keys.length){ resolve(null); return; }
+
+      keys.sort((a,b)=>
+        parseInt(a.split("-").pop())-
+        parseInt(b.split("-").pop())
+      );
+
+      const chunks=await Promise.all(
+        keys.map(k=>new Promise((res,rej)=>{
+          const r=store.get(k);
+          r.onsuccess=()=>res(r.result);
+          r.onerror=()=>rej(r.error);
+        }))
+      );
+
+      resolve(new Blob(chunks));
+    };
+    req.onerror=()=>reject(req.error);
+  });
+}
+
+async function loadAndCachePdfChunks(name,url){
+  const head=await fetch(url,{method:"HEAD"});
+  const size=+head.headers.get("content-length");
+  const parts=[];
+  for(let start=0;start<size;start+=CHUNK_SIZE){
+    const end=Math.min(start+CHUNK_SIZE,size);
+    const r=await fetch(url,{headers:{Range:`bytes=${start}-${end-1}`}});
+    const buf=await r.arrayBuffer();
+    const db=await openDB();
+    const tx=db.transaction(STORE_NAME,"readwrite");
+    tx.objectStore(STORE_NAME).put(buf,`${name}-chunk-${start}`);
+    parts.push(buf);
+  }
+  return new Blob(parts).arrayBuffer();
+}
+
+/* ===== PDF ===== */
+let pdf,total,current=1;
+
+async function renderPage(n){
+  const page=await pdf.getPage(n);
+  const vp=page.getViewport({scale:1.5});
+  canvas.width=vp.width; canvas.height=vp.height;
+  await page.render({canvasContext:ctx,viewport:vp}).promise;
+  current=n;
+  currentEl.textContent=n;
+}
+
+async function loadPdf(name){
+  const url=new URL("./"+name,location.href);
+  const cached=await getCachedChunks(name);
+  const data=cached
+    ? await cached.arrayBuffer()
+    : await loadAndCachePdfChunks(name,url.href);
+
+  pdf=(await getDocument({data}).promise);
+  total=pdf.numPages;
+  fileEl.textContent=name;
+  countEl.textContent=total;
+  renderPage(randomInt(1,total));
+}
+
+/* ===== Boot ===== */
+(async()=>{
+  if(!rawFile){ statusEl.textContent="Missing ?fileName"; return; }
+  try{
+    await loadPdf(rawFile);
+    statusEl.textContent="Loaded";
+  }catch(e){
+    console.error(e);
+    statusEl.textContent="Load failed";
+  }
+})();
+</script>
+</body>
+</html>
